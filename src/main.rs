@@ -131,6 +131,30 @@ fn is_hidden(entry: &std::fs::DirEntry) -> bool {
     false
 }
 
+const EXCLUDED_DIRS: &[&str] = &[
+    "target",       // Rust
+    "node_modules", // Node.js / JS / TS
+    "dist",         // JS/TS build output (webpack, vite, jne.)
+    "build",        // yleinen (C/C++, Gradle, jne.)
+    "out",          // yleinen build output
+    "bin",          // .NET / C, kääntötulokset
+    "obj",          // .NET
+    "vendor",       // Go / PHP / Ruby riippuvuudet
+    "__pycache__",  // Python bytecode-välimuisti
+    "venv",         // Python virtuaaliympäristö
+    "env",          // Python virtuaaliympäristö (yleinen vaihtoehto)
+];
+
+fn is_excluded_dir(entry: &std::fs::DirEntry) -> bool {
+    let Ok(file_type) = entry.file_type() else { return false };
+    if !file_type.is_dir() {
+        return false;
+    }
+
+    let name = entry.file_name();
+    EXCLUDED_DIRS.contains(&name.to_string_lossy().as_ref())
+}
+
 fn highlight_all(text: &str, pattern: &str, base: Color) -> String {
     let mut result = String::new();
     let mut start = 0;
@@ -158,7 +182,7 @@ fn handle_path(path: PathBuf, pool: Arc<Threadpool>, pattern: Arc<String>, pb: A
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
-                if is_hidden(&entry) {
+                if is_hidden(&entry) || is_excluded_dir(&entry) {
                     continue; 
                 }
 
