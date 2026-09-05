@@ -1,4 +1,4 @@
-use colored::Colorize;
+use colored::{Color, Colorize};
 use indicatif::ProgressBar;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -111,6 +111,29 @@ fn has_bom(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[0xFE, 0xFF]) // UTF-16 BE
 }
 
+fn highlight_all(text: &str, pattern: &str, base: Color) -> String {
+    let mut result = String::new();
+    let mut start = 0;
+
+    while let Some(pos) = text[start..].find(pattern) {
+        let abs_pos = start + pos;
+        if abs_pos > start {
+            result.push_str(&text[start..abs_pos].color(base).to_string());
+        }
+        result.push_str(
+            &text[abs_pos..abs_pos + pattern.len()]
+                .red()
+                .bold()
+                .to_string(),
+        );
+        start = abs_pos + pattern.len();
+    }
+    if start < text.len() {
+        result.push_str(&text[start..].color(base).to_string());
+    }
+    result
+}
+
 fn handle_path(path: PathBuf, pool: Arc<Threadpool>, pattern: Arc<String>, pb: Arc<ProgressBar>) {
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
@@ -121,8 +144,10 @@ fn handle_path(path: PathBuf, pool: Arc<Threadpool>, pattern: Arc<String>, pb: A
                 let pb2 = Arc::clone(&pb);
 
                 // Check if the file name contains the pattern before scheduling it for processing
-                if let Some(_) = entry.file_name().to_string_lossy().find(&*pattern) {
-                    println!("{}", entry_path.display());
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                if file_name.contains(&*pattern) {
+                    let full_path = entry_path.to_string_lossy();
+                    pb.println(highlight_all(&full_path, &pattern, Color::Cyan));
                 }
 
                 pool.execute(move || handle_path(entry_path, pool2, pattern2, pb2));
@@ -168,10 +193,11 @@ fn search_file(path: &Path, pattern: &str, pb: Arc<ProgressBar>) {
             let matched = &line[pos..pos + pattern.len()];
             let after = &line[pos + pattern.len()..to];
 
+            let path_str = path.display().to_string();
             pb.println(format!(
                 "{}:{}: ...{}{}{}...",
-                path.display(),
-                line_no,
+                highlight_all(&path_str, pattern, Color::Blue),
+                line_no.to_string().yellow(),
                 before,
                 matched.red().bold(),
                 after
