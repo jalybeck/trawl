@@ -210,35 +210,45 @@ fn highlight_all(text: &str, pattern: &str, base: Color) -> String {
     result
 }
 
-fn handle_path(path: PathBuf, pool: Arc<Threadpool>, pattern: Arc<String>, pb: Arc<ProgressBar>) {
+fn handle_path(
+    path: PathBuf,
+    pool: Arc<Threadpool>,
+    pattern: Arc<String>,
+    tx: mpsc::Sender<String>,
+    cmd_options: Arc<CmdOptions>,
+) {
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
-                if is_hidden(&entry) || is_excluded_dir(&entry) || is_cloud_placeholder(&entry) {
+                if !cmd_options.has(CmdOption::Hidden) && is_hidden(&entry) {
+                    continue;
+                }
+                if !cmd_options.has(CmdOption::Excluded) && (is_excluded_dir(&entry) || is_cloud_placeholder(&entry)) {
                     continue;
                 }
 
                 let entry_path = entry.path();
                 let pool2 = Arc::clone(&pool);
                 let pattern2 = Arc::clone(&pattern);
-                let pb2 = Arc::clone(&pb);
+                let tx2 = tx.clone();
+                let cmd_options2 = Arc::clone(&cmd_options);
 
                 // Check if the file name contains the pattern before scheduling it for processing
                 let file_name = entry.file_name().to_string_lossy().into_owned();
                 if file_name.contains(&*pattern) {
                     let full_path = entry_path.to_string_lossy();
-                    pb.println(highlight_all(&full_path, &pattern, Color::Cyan));
+                    let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan));
                 }
 
-                pool.execute(move || handle_path(entry_path, pool2, pattern2, pb2));
+                pool.execute(move || handle_path(entry_path, pool2, pattern2, tx2, cmd_options2));
             }
         }
     } else {
-        search_file(&path, &pattern, pb);
+        search_file(&path, &pattern, tx);
     }
 }
 
-fn search_file(path: &Path, pattern: &str, pb: Arc<ProgressBar>) {
+fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>) {
     let Ok(file) = File::open(path) else { return };
     let mut reader = BufReader::new(file);
 
@@ -277,7 +287,7 @@ fn search_file(path: &Path, pattern: &str, pb: Arc<ProgressBar>) {
             let suffix = if to == line.len() { "" } else { "..." };
 
             let path_str = path.display().to_string();
-            pb.println(format!(
+            let _ = tx.send(format!(
                 "{}:{}: {}{}{}{}{}",
                 highlight_all(&path_str, pattern, Color::Blue),
                 line_no.to_string().yellow(),
@@ -318,31 +328,88 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-fn main() {
+#[derive(PartialEq)]
+enum CmdOption {
+    Hidden,
+    Excluded,
+    All,
+}
+
+struct CmdOptions {
+    options: Vec<CmdOption>
+}
+
+impl CmdOptions {
+    fn has(&self, option: CmdOption) -> bool {
+        self.options
+            .iter()
+            .any(|o| *o == option || *o == CmdOption::All)
+    }
+}
+
+const USAGE: &str = "\
+Usage: trawl \"<keyword>\" [options]
+
+Options:
+  -h, --hidden     Also search hidden files and directories
+  -e, --excluded   Also search common build/dependency directories (target, node_modules, dist, ...)
+  -a, --all        Shorthand for --hidden --excluded
+";
+
+fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
     let Ok(cwd) = std::env::current_dir() else {
         eprintln!("Could not get current directory. exiting.");
         std::process::exit(1);
     };
-        
+
     let Some(pattern) = std::env::args().nth(1) else {
-        eprintln!("Usage: trawl \"<keyword>\"");
+        eprint!("{USAGE}");
         std::process::exit(1);
     };
+    
+    // Extract commandline options
+    let mut options = Vec::new();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--hidden" => options.push(CmdOption::Hidden),
+            "-e" | "--excluded" => options.push(CmdOption::Excluded),
+            "-a" | "--all" => options.push(CmdOption::All),
+            _ => {}
+        }
+    }
 
+    (cwd, pattern, CmdOptions { options })
+}
+
+fn main() {
+    let (cwd, pattern, cmd_options) = handle_args();
     let pattern = Arc::new(pattern);
+    let cmd_options = Arc::new(cmd_options);
 
     let start_time = std::time::Instant::now();
 
     let pb = Arc::new(ProgressBar::new_spinner());
-    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.enable_steady_tick(Duration::from_millis(150));
     pb.set_message("Trawling...");
+
+    // All match output goes through this channel to a single printer thread,
+    // so only one thread ever writes to the terminal.
+    let (tx, rx) = mpsc::channel::<String>();
+    let printer_pb = Arc::clone(&pb);
+    let printer = thread::spawn(move || {
+        for line in rx {
+            printer_pb.println(line);
+        }
+    });
 
     let pool = Arc::new(Threadpool::new());
 
     // Start processing from the current working directory.
-    handle_path(cwd, Arc::clone(&pool), pattern, Arc::clone(&pb));
+    handle_path(cwd, Arc::clone(&pool), pattern, tx, cmd_options);
 
     pool.wait(); // Wait until all jobs and their subtasks are processed
+
+    printer.join().unwrap(); // all senders are dropped by now, so the channel is closed
 
     pb.finish_and_clear();
 
