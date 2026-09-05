@@ -76,7 +76,7 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             dist/trawl_win_x64.zip dist/trawl_linux_x64.tar.gz \
             --title "trawl (build ${{ github.ref_name }})" \
-            --notes "Automaattinen build. Sisältää aina vain uusimmat binäärit."
+            --notes "Automatic build. Contains only the latest binaries."
 
       - name: Update README build table
         run: python3 scripts/update_release_table.py "${{ github.repository }}"
