@@ -108,11 +108,72 @@ impl Drop for Threadpool {
 
 const CONTEXT: usize = 20; // how many characters of context to show around a match
 
-fn has_bom(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xEF, 0xBB, 0xBF])       // UTF-8 BOM
-        || bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) // UTF-32 BE (check before UTF-16!)
-        || bytes.starts_with(&[0xFF, 0xFE])      // UTF-16 LE / UTF-32 LE
-        || bytes.starts_with(&[0xFE, 0xFF]) // UTF-16 BE
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Encoding {
+    Utf8Bom,
+    Utf16Le,
+    Utf16Be,
+    Utf32Le,
+    Utf32Be,
+    None,
+}
+
+impl Encoding {
+    fn bom_len(self) -> usize {
+        match self {
+            Encoding::Utf8Bom => 3,
+            Encoding::Utf16Le | Encoding::Utf16Be => 2,
+            Encoding::Utf32Le | Encoding::Utf32Be => 4,
+            Encoding::None => 0,
+        }
+    }
+}
+
+// UTF-32 LE's BOM (FF FE 00 00) starts with the same two bytes as UTF-16 LE's (FF FE),
+// so it must be checked first or it would always be misdetected as UTF-16 LE.
+fn detect_encoding(bytes: &[u8]) -> Encoding {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Encoding::Utf8Bom
+    } else if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        Encoding::Utf32Be
+    } else if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        Encoding::Utf32Le
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        Encoding::Utf16Le
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Encoding::Utf16Be
+    } else {
+        Encoding::None
+    }
+}
+
+fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
+    let units = bytes.chunks_exact(2).map(|c| {
+        let arr = [c[0], c[1]];
+        if big_endian {
+            u16::from_be_bytes(arr)
+        } else {
+            u16::from_le_bytes(arr)
+        }
+    });
+    char::decode_utf16(units)
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+fn decode_utf32(bytes: &[u8], big_endian: bool) -> String {
+    bytes
+        .chunks_exact(4)
+        .map(|c| {
+            let arr = [c[0], c[1], c[2], c[3]];
+            let code = if big_endian {
+                u32::from_be_bytes(arr)
+            } else {
+                u32::from_le_bytes(arr)
+            };
+            char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
+        })
+        .collect()
 }
 
 fn is_hidden(entry: &std::fs::DirEntry) -> bool {
@@ -279,14 +340,49 @@ fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>) {
     let Ok(file) = File::open(path) else { return };
     let mut reader = BufReader::new(file);
 
-    // git-style binary file detection: skip files containing null bytes
-    match reader.fill_buf() {
-        Ok(peek) if has_bom(peek) => {}
-        Ok(peek) if peek.contains(&0) => return,
-        Ok(_) => {}
+    let encoding = match reader.fill_buf() {
+        Ok(peek) => detect_encoding(peek),
         Err(_) => return,
+    };
+
+    if encoding == Encoding::None {
+        // git-style binary file detection: skip files containing null bytes
+        match reader.fill_buf() {
+            Ok(peek) if peek.contains(&0) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        search_utf8_lines(&mut reader, path, pattern, &tx);
+        return;
     }
 
+    // BOM'd encodings can't be decoded line-by-line as raw bytes, so read+decode the whole file.
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let bom_len = encoding.bom_len();
+    if bytes.len() < bom_len {
+        return;
+    }
+    let body = &bytes[bom_len..];
+    let text = match encoding {
+        Encoding::Utf8Bom => String::from_utf8_lossy(body).into_owned(),
+        Encoding::Utf16Le => decode_utf16(body, false),
+        Encoding::Utf16Be => decode_utf16(body, true),
+        Encoding::Utf32Le => decode_utf32(body, false),
+        Encoding::Utf32Be => decode_utf32(body, true),
+        Encoding::None => unreachable!(),
+    };
+
+    for (i, line) in text.lines().enumerate() {
+        process_line(path, pattern, i + 1, line, &tx);
+    }
+}
+
+fn search_utf8_lines(
+    reader: &mut BufReader<File>,
+    path: &Path,
+    pattern: &str,
+    tx: &mpsc::Sender<String>,
+) {
     let mut buf = Vec::new(); // reused for each line to avoid repeated allocations
     let mut line_no = 0usize;
 
@@ -302,29 +398,33 @@ fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>) {
         let line = String::from_utf8_lossy(&buf);
         let line = line.trim_end_matches(['\r', '\n']);
 
-        if let Some(pos) = line.find(pattern) {
-            let from = floor_char_boundary(line, pos.saturating_sub(CONTEXT));
-            let to = ceil_char_boundary(line, (pos + pattern.len() + CONTEXT).min(line.len()));
+        process_line(path, pattern, line_no, line, tx);
+    }
+}
 
-            let before = &line[from..pos];
-            let matched = &line[pos..pos + pattern.len()];
-            let after = &line[pos + pattern.len()..to];
+fn process_line(path: &Path, pattern: &str, line_no: usize, line: &str, tx: &mpsc::Sender<String>) {
+    if let Some(pos) = line.find(pattern) {
+        let from = floor_char_boundary(line, pos.saturating_sub(CONTEXT));
+        let to = ceil_char_boundary(line, (pos + pattern.len() + CONTEXT).min(line.len()));
 
-            let prefix = if from == 0 { "" } else { "..." };
-            let suffix = if to == line.len() { "" } else { "..." };
+        let before = &line[from..pos];
+        let matched = &line[pos..pos + pattern.len()];
+        let after = &line[pos + pattern.len()..to];
 
-            let path_str = path.display().to_string();
-            let _ = tx.send(format!(
-                "{}:{}: {}{}{}{}{}",
-                highlight_all(&path_str, pattern, Color::Blue),
-                line_no.to_string().yellow(),
-                prefix,
-                before,
-                matched.red().bold(),
-                after,
-                suffix
-            ));
-        }
+        let prefix = if from == 0 { "" } else { "..." };
+        let suffix = if to == line.len() { "" } else { "..." };
+
+        let path_str = path.display().to_string();
+        let _ = tx.send(format!(
+            "{}:{}: {}{}{}{}{}",
+            highlight_all(&path_str, pattern, Color::Blue),
+            line_no.to_string().yellow(),
+            prefix,
+            before,
+            matched.red().bold(),
+            after,
+            suffix
+        ));
     }
 }
 
@@ -447,4 +547,162 @@ fn main() {
 
     let duration = start_time.elapsed();
     println!("Trawling completed in: {}", format_duration(duration));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn write_temp_file(name_hint: &str, bytes: &[u8]) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "trawl_test_{}_{}_{}.txt",
+            std::process::id(),
+            name_hint,
+            id
+        ));
+        File::create(&path).unwrap().write_all(bytes).unwrap();
+        path
+    }
+
+    // colored decides at runtime whether to emit ANSI escapes based on TTY detection, which
+    // would otherwise make substring assertions on the search output flaky under `cargo test`.
+    fn run_search(bytes: &[u8], pattern: &str, name_hint: &str) -> Vec<String> {
+        colored::control::set_override(false);
+        let path = write_temp_file(name_hint, bytes);
+        let (tx, rx) = mpsc::channel();
+        search_file(&path, pattern, tx);
+        let results: Vec<String> = rx.iter().collect();
+        let _ = std::fs::remove_file(&path);
+        results
+    }
+
+    fn utf16_bytes(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend_from_slice(if big_endian {
+                &[0xFE, 0xFF]
+            } else {
+                &[0xFF, 0xFE]
+            });
+        }
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        out
+    }
+
+    fn utf32_bytes(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend_from_slice(if big_endian {
+                &[0x00, 0x00, 0xFE, 0xFF]
+            } else {
+                &[0xFF, 0xFE, 0x00, 0x00]
+            });
+        }
+        for ch in text.chars() {
+            let code = ch as u32;
+            out.extend_from_slice(&if big_endian {
+                code.to_be_bytes()
+            } else {
+                code.to_le_bytes()
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn detects_encodings_by_bom() {
+        assert_eq!(detect_encoding(&[0xEF, 0xBB, 0xBF, b'h']), Encoding::Utf8Bom);
+        assert_eq!(detect_encoding(&[0xFF, 0xFE, b'h', 0]), Encoding::Utf16Le);
+        assert_eq!(detect_encoding(&[0xFE, 0xFF, 0, b'h']), Encoding::Utf16Be);
+        assert_eq!(detect_encoding(&[0xFF, 0xFE, 0x00, 0x00]), Encoding::Utf32Le);
+        assert_eq!(detect_encoding(&[0x00, 0x00, 0xFE, 0xFF]), Encoding::Utf32Be);
+        assert_eq!(detect_encoding(b"plain text"), Encoding::None);
+    }
+
+    #[test]
+    fn searches_plain_utf8_without_bom() {
+        let results = run_search(b"hello needle world\n", "needle", "plain");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":1:"));
+    }
+
+    #[test]
+    fn searches_utf8_with_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"line one\nfind needle here\nline three\n");
+        let results = run_search(&bytes, "needle", "utf8bom");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":2:"));
+    }
+
+    #[test]
+    fn does_not_leak_bom_char_into_first_line() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"needle at start\n");
+        let results = run_search(&bytes, "needle", "utf8bom_start");
+        assert_eq!(results.len(), 1);
+        // The BOM char (U+FEFF) must not end up glued onto the matched line.
+        assert!(!results[0].contains('\u{feff}'));
+        assert!(results[0].contains(":1:"));
+    }
+
+    #[test]
+    fn searches_utf16_le() {
+        let bytes = utf16_bytes("line one\nfind needle here\nline three\n", false, true);
+        let results = run_search(&bytes, "needle", "utf16le");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":2:"));
+    }
+
+    #[test]
+    fn searches_utf16_be() {
+        let bytes = utf16_bytes("line one\nfind needle here\nline three\n", true, true);
+        let results = run_search(&bytes, "needle", "utf16be");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":2:"));
+    }
+
+    #[test]
+    fn searches_utf32_le() {
+        let bytes = utf32_bytes("line one\nfind needle here\nline three\n", false, true);
+        let results = run_search(&bytes, "needle", "utf32le");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":2:"));
+    }
+
+    #[test]
+    fn searches_utf32_be() {
+        let bytes = utf32_bytes("line one\nfind needle here\nline three\n", true, true);
+        let results = run_search(&bytes, "needle", "utf32be");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":2:"));
+    }
+
+    #[test]
+    fn utf16_multiple_matches_on_different_lines() {
+        let bytes = utf16_bytes("needle one\nno match\nneedle two\n", true, true);
+        let results = run_search(&bytes, "needle", "utf16be_multi");
+        assert_eq!(results.len(), 2);
+        assert!(results[0].contains(":1:"));
+        assert!(results[1].contains(":3:"));
+    }
+
+    #[test]
+    fn plain_binary_file_without_bom_is_skipped() {
+        let bytes = vec![b'a', b'b', 0u8, b'c', b'd'];
+        let results = run_search(&bytes, "ab", "binary");
+        assert!(results.is_empty());
+    }
 }
