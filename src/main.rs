@@ -68,7 +68,11 @@ impl Threadpool {
 
         let pending = Arc::clone(&self.pending);
         let job: Job = Box::new(move || {
-            f();
+            // Execute the job and catch any panics to prevent the thread from crashing
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                eprintln!("trawl: worker task panicked: {:?}", payload);
+            }
+
             let (lock, cvar) = &*pending;
             let mut count = lock.lock().unwrap();
             *count -= 1; // "Done()"
@@ -162,8 +166,8 @@ fn is_cloud_placeholder(entry: &std::fs::DirEntry) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000; // Onedrive: remote content not locally available
-        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;        // Onedrive: remote content will be available on open
-        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;               // HSM (Hierarchical Storage Management) / offline content
+        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000; // Onedrive: remote content will be available on open
+        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000; // HSM (Hierarchical Storage Management) / offline content
 
         if let Ok(metadata) = entry.metadata() {
             let attrs = metadata.file_attributes();
@@ -315,7 +319,10 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn main() {
-    let pattern = std::env::args().nth(1).expect("Usage: trawl \"<keyword>\"");
+    let Some(pattern) = std::env::args().nth(1) else {
+        eprintln!("Usage: trawl \"<keyword>\"");
+        std::process::exit(1);
+    };    
     let pattern = Arc::new(pattern);
 
     let start_time = std::time::Instant::now();
