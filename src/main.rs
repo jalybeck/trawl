@@ -389,16 +389,21 @@ fn main() {
     let start_time = std::time::Instant::now();
 
     let pb = Arc::new(ProgressBar::new_spinner());
-    pb.enable_steady_tick(Duration::from_millis(150));
     pb.set_message("Trawling...");
 
-    // All match output goes through this channel to a single printer thread,
-    // so only one thread ever writes to the terminal.
+    // No enable_steady_tick(): that spawns indicatif's own background redraw thread,
+    // which would again touch the terminal concurrently with the printer thread below.
+    // Instead, this single printer thread both prints and ticks the spinner itself.
     let (tx, rx) = mpsc::channel::<String>();
     let printer_pb = Arc::clone(&pb);
     let printer = thread::spawn(move || {
-        for line in rx {
-            printer_pb.println(line);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(line) => printer_pb.println(line),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            printer_pb.tick();
         }
     });
 
