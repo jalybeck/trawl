@@ -111,6 +111,26 @@ fn has_bom(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[0xFE, 0xFF]) // UTF-16 BE
 }
 
+fn is_hidden(entry: &std::fs::DirEntry) -> bool {
+    let name = entry.file_name();
+    if name.to_string_lossy().starts_with('.') {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn highlight_all(text: &str, pattern: &str, base: Color) -> String {
     let mut result = String::new();
     let mut start = 0;
@@ -138,6 +158,10 @@ fn handle_path(path: PathBuf, pool: Arc<Threadpool>, pattern: Arc<String>, pb: A
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
+                if is_hidden(&entry) {
+                    continue; 
+                }
+
                 let entry_path = entry.path();
                 let pool2 = Arc::clone(&pool);
                 let pattern2 = Arc::clone(&pattern);
