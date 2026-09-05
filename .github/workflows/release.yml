@@ -1,0 +1,90 @@
+name: Release
+
+# Triggered by pushing any git tag, e.g.: git tag build-2026-09-05 && git push origin build-2026-09-05
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            binary: trawl.exe
+            archive: trawl_win_x64.zip
+          - os: ubuntu-latest
+            binary: trawl
+            archive: trawl_linux_x64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo build --release
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/${{ matrix.binary }} -DestinationPath ${{ matrix.archive }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf ${{ matrix.archive }} -C target/release ${{ matrix.binary }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Only the newest build is ever kept, so remove every previous release + its tag first.
+      - name: Delete previous releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in $(gh release list --limit 100 --json tagName -q '.[].tagName'); do
+            if [ "$tag" != "${{ github.ref_name }}" ]; then
+              gh release delete "$tag" --yes --cleanup-tag
+            fi
+          done
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/trawl_win_x64.zip dist/trawl_linux_x64.tar.gz \
+            --title "trawl (build ${{ github.ref_name }})" \
+            --notes "Automaattinen build. Sisältää aina vain uusimmat binäärit."
+
+      - name: Update README build table
+        run: python3 scripts/update_release_table.py "${{ github.repository }}"
+
+      - name: Commit README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || git commit -m "docs: update build table [skip ci]"
+          git push origin HEAD:${{ github.event.repository.default_branch }}

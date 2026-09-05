@@ -27,3 +27,14 @@ The initial implementation favors simplicity and uses buffered file I/O and a sh
 ## Status
 
 Early development.
+
+## Downloads
+
+Latest automatically built binaries. The table updates whenever a new git tag triggers a
+build and publishes release packages; older versions are not kept.
+
+<!-- BUILD_TABLE_START -->
+| Package | Platform | Built |
+| --- | --- | --- |
+| no builds yet | - | - |
+<!-- BUILD_TABLE_END -->
