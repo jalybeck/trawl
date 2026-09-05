@@ -319,10 +319,16 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn main() {
+    let Ok(cwd) = std::env::current_dir() else {
+        eprintln!("Could not get current directory. exiting.");
+        std::process::exit(1);
+    };
+        
     let Some(pattern) = std::env::args().nth(1) else {
         eprintln!("Usage: trawl \"<keyword>\"");
         std::process::exit(1);
-    };    
+    };
+
     let pattern = Arc::new(pattern);
 
     let start_time = std::time::Instant::now();
@@ -332,7 +338,6 @@ fn main() {
     pb.set_message("Trawling...");
 
     let pool = Arc::new(Threadpool::new());
-    let cwd = std::env::current_dir().expect("Could not get current directory. exiting.");
 
     // Start processing from the current working directory.
     handle_path(cwd, Arc::clone(&pool), pattern, Arc::clone(&pb));

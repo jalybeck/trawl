@@ -2,7 +2,7 @@
 
 Trawl is a fast, multithreaded command-line tool for searching files, directories, and file contents.
 
-The goal of the project is simple: start from the filesystem root, traverse the directory tree using a pool of worker threads, and stream matches to the terminal as they are discovered.
+The goal of the project is simple: start from the users current directory, traverse the directory tree using a pool of worker threads, and stream matches to the terminal as they are discovered.
 
 ```bash
 trawl "search term"
