@@ -149,10 +149,28 @@ const EXCLUDED_DIRS: &[&str] = &[
     "env",          // Python virtual environment (common alternative)
 ];
 
-// entry.file_type() reports the link itself (does not follow it), unlike path.is_dir()/read_dir()
-// which would - skipping symlinks avoids escaping into unrelated trees and possible symlink cycles.
+// Uses entry.metadata() (not file_type()): on WSL/DrvFs the readdir d_type fast path
+// file_type() relies on can misreport Windows junctions/reparse points as directories,
+// while metadata() always performs a real lstat-equivalent call and reports them correctly.
+// On Windows, std's is_symlink() only recognizes the SYMLINK reparse tag, not MOUNT_POINT
+// (junctions, e.g. the legacy `Application Data` -> `AppData\Roaming` alias) - so check the
+// raw FILE_ATTRIBUTE_REPARSE_POINT bit directly to catch every reparse point, not just symlinks.
 fn is_symlink(entry: &std::fs::DirEntry) -> bool {
-    entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false)
+    let Ok(metadata) = entry.metadata() else {
+        return false;
+    };
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn is_excluded_dir(entry: &std::fs::DirEntry) -> bool {
