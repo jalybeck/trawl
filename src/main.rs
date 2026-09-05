@@ -149,6 +149,12 @@ const EXCLUDED_DIRS: &[&str] = &[
     "env",          // Python virtual environment (common alternative)
 ];
 
+// entry.file_type() reports the link itself (does not follow it), unlike path.is_dir()/read_dir()
+// which would - skipping symlinks avoids escaping into unrelated trees and possible symlink cycles.
+fn is_symlink(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false)
+}
+
 fn is_excluded_dir(entry: &std::fs::DirEntry) -> bool {
     let Ok(file_type) = entry.file_type() else {
         return false;
@@ -220,6 +226,9 @@ fn handle_path(
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
+                if is_symlink(&entry) {
+                    continue;
+                }
                 if !cmd_options.has(CmdOption::Hidden) && is_hidden(&entry) {
                     continue;
                 }
