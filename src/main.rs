@@ -10,12 +10,12 @@ use std::time::Duration;
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 struct Worker {
-    id: usize,
+    _id: usize,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let handle = thread::spawn(move || {
             loop {
                 // lock is released immediately after the message is received (recv returns the value)
@@ -29,7 +29,7 @@ impl Worker {
         });
 
         Worker {
-            id,
+            _id,
             handle: Some(handle),
         }
     }
@@ -106,7 +106,7 @@ const CONTEXT: usize = 20; // how many characters of context to show around a ma
 
 fn has_bom(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xEF, 0xBB, 0xBF])       // UTF-8 BOM
-        || bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) // UTF-32 BE (tarkista ennen UTF-16:ta!)
+        || bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) // UTF-32 BE (check before UTF-16!)
         || bytes.starts_with(&[0xFF, 0xFE])      // UTF-16 LE / UTF-32 LE
         || bytes.starts_with(&[0xFE, 0xFF]) // UTF-16 BE
 }
@@ -135,24 +135,52 @@ const EXCLUDED_DIRS: &[&str] = &[
     "target",       // Rust
     "node_modules", // Node.js / JS / TS
     "dist",         // JS/TS build output (webpack, vite, jne.)
-    "build",        // yleinen (C/C++, Gradle, jne.)
-    "out",          // yleinen build output
+    "build",        // Common (C/C++, Gradle, jne.)
+    "out",          // Common build output
     "bin",          // .NET / C, kääntötulokset
     "obj",          // .NET
-    "vendor",       // Go / PHP / Ruby riippuvuudet
-    "__pycache__",  // Python bytecode-välimuisti
-    "venv",         // Python virtuaaliympäristö
-    "env",          // Python virtuaaliympäristö (yleinen vaihtoehto)
+    "vendor",       // Go / PHP / Ruby dependencies
+    "__pycache__",  // Python bytecode cache
+    "venv",         // Python virtual environment
+    "env",          // Python virtual environment (common alternative)
 ];
 
 fn is_excluded_dir(entry: &std::fs::DirEntry) -> bool {
-    let Ok(file_type) = entry.file_type() else { return false };
+    let Ok(file_type) = entry.file_type() else {
+        return false;
+    };
     if !file_type.is_dir() {
         return false;
     }
 
     let name = entry.file_name();
     EXCLUDED_DIRS.contains(&name.to_string_lossy().as_ref())
+}
+
+fn is_cloud_placeholder(entry: &std::fs::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000; // Onedrive: remote content not locally available
+        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;        // Onedrive: remote content will be available on open
+        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;               // HSM (Hierarchical Storage Management) / offline content
+
+        if let Ok(metadata) = entry.metadata() {
+            let attrs = metadata.file_attributes();
+            return attrs
+                & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+                    | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                    | FILE_ATTRIBUTE_OFFLINE)
+                != 0;
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = entry; // muilla alustoilla tätä ongelmaa ei ole
+    }
+
+    false
 }
 
 fn highlight_all(text: &str, pattern: &str, base: Color) -> String {
@@ -182,8 +210,8 @@ fn handle_path(path: PathBuf, pool: Arc<Threadpool>, pattern: Arc<String>, pb: A
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
-                if is_hidden(&entry) || is_excluded_dir(&entry) {
-                    continue; 
+                if is_hidden(&entry) || is_excluded_dir(&entry) || is_cloud_placeholder(&entry) {
+                    continue;
                 }
 
                 let entry_path = entry.path();
@@ -241,14 +269,19 @@ fn search_file(path: &Path, pattern: &str, pb: Arc<ProgressBar>) {
             let matched = &line[pos..pos + pattern.len()];
             let after = &line[pos + pattern.len()..to];
 
+            let prefix = if from == 0 { "" } else { "..." };
+            let suffix = if to == line.len() { "" } else { "..." };
+
             let path_str = path.display().to_string();
             pb.println(format!(
-                "{}:{}: ...{}{}{}...",
+                "{}:{}: {}{}{}{}{}",
                 highlight_all(&path_str, pattern, Color::Blue),
                 line_no.to_string().yellow(),
+                prefix,
                 before,
                 matched.red().bold(),
-                after
+                after,
+                suffix
             ));
         }
     }
@@ -270,9 +303,22 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
     idx
 }
 
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    if total_secs >= 60 {
+        let minutes = total_secs / 60;
+        let seconds = total_secs % 60;
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{:?}", d) // alle minuutin: käytä olemassa olevaa ns/µs/ms/s-vaihtelua
+    }
+}
+
 fn main() {
     let pattern = std::env::args().nth(1).expect("Usage: trawl \"<keyword>\"");
     let pattern = Arc::new(pattern);
+
+    let start_time = std::time::Instant::now();
 
     let pb = Arc::new(ProgressBar::new_spinner());
     pb.enable_steady_tick(Duration::from_millis(80));
@@ -287,4 +333,7 @@ fn main() {
     pool.wait(); // Wait until all jobs and their subtasks are processed
 
     pb.finish_and_clear();
+
+    let duration = start_time.elapsed();
+    println!("Trawling completed in: {}", format_duration(duration));
 }
