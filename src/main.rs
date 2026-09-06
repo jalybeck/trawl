@@ -272,11 +272,34 @@ fn is_cloud_placeholder(entry: &std::fs::DirEntry) -> bool {
     false
 }
 
-fn highlight_all(text: &str, pattern: &str, base: Color) -> String {
+// Byte-level ASCII case folding is safe on UTF-8: multi-byte sequence bytes always have the
+// high bit set (>= 0x80), so folding only ever touches standalone ASCII bytes and can never
+// shift a match off a char boundary. Non-ASCII letters (e.g. "é") are still compared exactly.
+fn find_pattern(haystack: &str, pattern: &str, case_sensitive: bool) -> Option<usize> {
+    if case_sensitive {
+        return haystack.find(pattern);
+    }
+
+    let hay = haystack.as_bytes();
+    let pat = pattern.as_bytes();
+    if pat.is_empty() {
+        return Some(0);
+    }
+    if pat.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - pat.len()).find(|&i| hay[i..i + pat.len()].eq_ignore_ascii_case(pat))
+}
+
+fn contains_pattern(haystack: &str, pattern: &str, case_sensitive: bool) -> bool {
+    find_pattern(haystack, pattern, case_sensitive).is_some()
+}
+
+fn highlight_all(text: &str, pattern: &str, base: Color, case_sensitive: bool) -> String {
     let mut result = String::new();
     let mut start = 0;
 
-    while let Some(pos) = text[start..].find(pattern) {
+    while let Some(pos) = find_pattern(&text[start..], pattern, case_sensitive) {
         let abs_pos = start + pos;
         if abs_pos > start {
             result.push_str(&text[start..abs_pos].color(base).to_string());
@@ -320,23 +343,24 @@ fn handle_path(
                 let pattern2 = Arc::clone(&pattern);
                 let tx2 = tx.clone();
                 let cmd_options2 = Arc::clone(&cmd_options);
+                let case_sensitive = cmd_options.has(CmdOption::CaseSensitive);
 
                 // Check if the file name contains the pattern before scheduling it for processing
                 let file_name = entry.file_name().to_string_lossy().into_owned();
-                if file_name.contains(&*pattern) {
+                if contains_pattern(&file_name, &pattern, case_sensitive) {
                     let full_path = entry_path.to_string_lossy();
-                    let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan));
+                    let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan, case_sensitive));
                 }
 
                 pool.execute(move || handle_path(entry_path, pool2, pattern2, tx2, cmd_options2));
             }
         }
     } else {
-        search_file(&path, &pattern, tx);
+        search_file(&path, &pattern, tx, cmd_options.has(CmdOption::CaseSensitive));
     }
 }
 
-fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>) {
+fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>, case_sensitive: bool) {
     let Ok(file) = File::open(path) else { return };
     let mut reader = BufReader::new(file);
 
@@ -352,7 +376,7 @@ fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>) {
             Ok(_) => {}
             Err(_) => return,
         }
-        search_utf8_lines(&mut reader, path, pattern, &tx);
+        search_utf8_lines(&mut reader, path, pattern, &tx, case_sensitive);
         return;
     }
 
@@ -373,7 +397,7 @@ fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>) {
     };
 
     for (i, line) in text.lines().enumerate() {
-        process_line(path, pattern, i + 1, line, &tx);
+        process_line(path, pattern, i + 1, line, &tx, case_sensitive);
     }
 }
 
@@ -382,6 +406,7 @@ fn search_utf8_lines(
     path: &Path,
     pattern: &str,
     tx: &mpsc::Sender<String>,
+    case_sensitive: bool,
 ) {
     let mut buf = Vec::new(); // reused for each line to avoid repeated allocations
     let mut line_no = 0usize;
@@ -398,12 +423,19 @@ fn search_utf8_lines(
         let line = String::from_utf8_lossy(&buf);
         let line = line.trim_end_matches(['\r', '\n']);
 
-        process_line(path, pattern, line_no, line, tx);
+        process_line(path, pattern, line_no, line, tx, case_sensitive);
     }
 }
 
-fn process_line(path: &Path, pattern: &str, line_no: usize, line: &str, tx: &mpsc::Sender<String>) {
-    if let Some(pos) = line.find(pattern) {
+fn process_line(
+    path: &Path,
+    pattern: &str,
+    line_no: usize,
+    line: &str,
+    tx: &mpsc::Sender<String>,
+    case_sensitive: bool,
+) {
+    if let Some(pos) = find_pattern(line, pattern, case_sensitive) {
         let from = floor_char_boundary(line, pos.saturating_sub(CONTEXT));
         let to = ceil_char_boundary(line, (pos + pattern.len() + CONTEXT).min(line.len()));
 
@@ -417,7 +449,7 @@ fn process_line(path: &Path, pattern: &str, line_no: usize, line: &str, tx: &mps
         let path_str = path.display().to_string();
         let _ = tx.send(format!(
             "{}:{}: {}{}{}{}{}",
-            highlight_all(&path_str, pattern, Color::Blue),
+            highlight_all(&path_str, pattern, Color::Blue, case_sensitive),
             line_no.to_string().yellow(),
             prefix,
             before,
@@ -460,6 +492,7 @@ enum CmdOption {
     Hidden,
     Excluded,
     All,
+    CaseSensitive,
 }
 
 struct CmdOptions {
@@ -468,9 +501,12 @@ struct CmdOptions {
 
 impl CmdOptions {
     fn has(&self, option: CmdOption) -> bool {
+        // CaseSensitive is deliberately excluded from the --all shorthand: search is
+        // case-insensitive by default and must be opted into explicitly via -c.
+        let all_applies = matches!(option, CmdOption::Hidden | CmdOption::Excluded);
         self.options
             .iter()
-            .any(|o| *o == option || *o == CmdOption::All)
+            .any(|o| *o == option || (all_applies && *o == CmdOption::All))
     }
 }
 
@@ -478,9 +514,10 @@ const USAGE: &str = "\
 Usage: trawl \"<keyword>\" [options]
 
 Options:
-  -h, --hidden     Also search hidden files and directories
-  -e, --excluded   Also search common build/dependency directories (target, node_modules, dist, ...)
-  -a, --all        Shorthand for --hidden --excluded
+  -h, --hidden         Also search hidden files and directories
+  -e, --excluded       Also search common build/dependency directories (target, node_modules, dist, ...)
+  -a, --all            Shorthand for --hidden --excluded
+  -c, --case-sensitive Case-sensitive search (default: case-insensitive)
 ";
 
 fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
@@ -501,6 +538,7 @@ fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
             "-h" | "--hidden" => options.push(CmdOption::Hidden),
             "-e" | "--excluded" => options.push(CmdOption::Excluded),
             "-a" | "--all" => options.push(CmdOption::All),
+            "-c" | "--case-sensitive" => options.push(CmdOption::CaseSensitive),
             _ => {}
         }
     }
@@ -573,10 +611,19 @@ mod tests {
     // colored decides at runtime whether to emit ANSI escapes based on TTY detection, which
     // would otherwise make substring assertions on the search output flaky under `cargo test`.
     fn run_search(bytes: &[u8], pattern: &str, name_hint: &str) -> Vec<String> {
+        run_search_with_case(bytes, pattern, name_hint, true)
+    }
+
+    fn run_search_with_case(
+        bytes: &[u8],
+        pattern: &str,
+        name_hint: &str,
+        case_sensitive: bool,
+    ) -> Vec<String> {
         colored::control::set_override(false);
         let path = write_temp_file(name_hint, bytes);
         let (tx, rx) = mpsc::channel();
-        search_file(&path, pattern, tx);
+        search_file(&path, pattern, tx, case_sensitive);
         let results: Vec<String> = rx.iter().collect();
         let _ = std::fs::remove_file(&path);
         results
@@ -704,5 +751,78 @@ mod tests {
         let bytes = vec![b'a', b'b', 0u8, b'c', b'd'];
         let results = run_search(&bytes, "ab", "binary");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn find_pattern_case_insensitive_basic() {
+        assert_eq!(find_pattern("Hello World", "world", false), Some(6));
+        assert_eq!(find_pattern("Hello World", "world", true), None);
+        assert_eq!(find_pattern("Hello World", "WORLD", false), Some(6));
+    }
+
+    #[test]
+    fn find_pattern_case_insensitive_leaves_non_ascii_bytes_intact() {
+        // "caf\u{e9}" (non-ASCII 'e' with acute accent) must still match exactly, unaffected by folding.
+        assert_eq!(find_pattern("café bar", "café", false), Some(0));
+        assert_eq!(find_pattern("café bar", "CAFÉ", false), None);
+    }
+
+    #[test]
+    fn cmd_option_all_does_not_imply_case_sensitive() {
+        let opts = CmdOptions {
+            options: vec![CmdOption::All],
+        };
+        assert!(opts.has(CmdOption::Hidden));
+        assert!(opts.has(CmdOption::Excluded));
+        assert!(!opts.has(CmdOption::CaseSensitive));
+    }
+
+    #[test]
+    fn search_is_case_insensitive_by_default() {
+        let results = run_search_with_case(b"Hello NEEDLE world\n", "needle", "ci_default", false);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(":1:"));
+    }
+
+    #[test]
+    fn search_with_case_sensitive_flag_rejects_different_case() {
+        let results = run_search_with_case(b"Hello NEEDLE world\n", "needle", "cs_flag", true);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_search_works_across_all_encodings() {
+        let text = "Find NEEDLE here\n";
+
+        let mut utf8bom = vec![0xEF, 0xBB, 0xBF];
+        utf8bom.extend_from_slice(text.as_bytes());
+        assert_eq!(
+            run_search_with_case(&utf8bom, "needle", "ci_utf8bom", false).len(),
+            1
+        );
+
+        let utf16le = utf16_bytes(text, false, true);
+        assert_eq!(
+            run_search_with_case(&utf16le, "needle", "ci_utf16le", false).len(),
+            1
+        );
+
+        let utf16be = utf16_bytes(text, true, true);
+        assert_eq!(
+            run_search_with_case(&utf16be, "needle", "ci_utf16be", false).len(),
+            1
+        );
+
+        let utf32le = utf32_bytes(text, false, true);
+        assert_eq!(
+            run_search_with_case(&utf32le, "needle", "ci_utf32le", false).len(),
+            1
+        );
+
+        let utf32be = utf32_bytes(text, true, true);
+        assert_eq!(
+            run_search_with_case(&utf32be, "needle", "ci_utf32be", false).len(),
+            1
+        );
     }
 }
