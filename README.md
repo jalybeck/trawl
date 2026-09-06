@@ -26,7 +26,7 @@ The initial implementation favors simplicity and uses buffered file I/O and a sh
 
 ## Status
 
-Early development.
+Stable.
 
 ## Downloads
 
