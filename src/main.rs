@@ -339,10 +339,6 @@ fn handle_path(
                 }
 
                 let entry_path = entry.path();
-                let pool2 = Arc::clone(&pool);
-                let pattern2 = Arc::clone(&pattern);
-                let tx2 = tx.clone();
-                let cmd_options2 = Arc::clone(&cmd_options);
                 let case_sensitive = cmd_options.has(CmdOption::CaseSensitive);
 
                 // Check if the file name contains the pattern before scheduling it for processing
@@ -352,7 +348,15 @@ fn handle_path(
                     let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan, case_sensitive));
                 }
 
-                pool.execute(move || handle_path(entry_path, pool2, pattern2, tx2, cmd_options2));
+                // The block shadows the outer Arc/Sender bindings with clones scoped to just
+                // this argument, so `pool.execute` below still refers to the original `pool`.
+                pool.execute({
+                    let pool = Arc::clone(&pool);
+                    let pattern = Arc::clone(&pattern);
+                    let tx = tx.clone();
+                    let cmd_options = Arc::clone(&cmd_options);
+                    move || handle_path(entry_path, pool, pattern, tx, cmd_options)
+                });
             }
         }
     } else {
@@ -560,15 +564,17 @@ fn main() {
     // which would again touch the terminal concurrently with the printer thread below.
     // Instead, this single printer thread both prints and ticks the spinner itself.
     let (tx, rx) = mpsc::channel::<String>();
-    let printer_pb = Arc::clone(&pb);
-    let printer = thread::spawn(move || {
-        loop {
-            match rx.recv_timeout(Duration::from_millis(80)) {
-                Ok(line) => printer_pb.println(line),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+    let printer = thread::spawn({
+        let pb = Arc::clone(&pb);
+        move || {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(80)) {
+                    Ok(line) => pb.println(line),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                pb.tick();
             }
-            printer_pb.tick();
         }
     });
 
