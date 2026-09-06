@@ -288,7 +288,16 @@ fn find_pattern(haystack: &str, pattern: &str, case_sensitive: bool) -> Option<u
     if pat.len() > hay.len() {
         return None;
     }
-    (0..=hay.len() - pat.len()).find(|&i| hay[i..i + pat.len()].eq_ignore_ascii_case(pat))
+
+    // Cheap single-byte pre-filter avoids the full eq_ignore_ascii_case comparison
+    // (and its slice/iterator overhead) at almost every position; profiling showed
+    // this loop dominating CPU time under case-insensitive search.
+    let first_lower = pat[0].to_ascii_lowercase();
+    let first_upper = pat[0].to_ascii_uppercase();
+    let last = hay.len() - pat.len();
+    (0..=last)
+        .filter(|&i| hay[i] == first_lower || hay[i] == first_upper)
+        .find(|&i| hay[i..i + pat.len()].eq_ignore_ascii_case(pat))
 }
 
 fn contains_pattern(haystack: &str, pattern: &str, case_sensitive: bool) -> bool {
