@@ -3,108 +3,9 @@ use indicatif::ProgressBar;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
-
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-struct Worker {
-    _id: usize,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl Worker {
-    fn new(_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
-        let handle = thread::spawn(move || {
-            loop {
-                // lock is released immediately after the message is received (recv returns the value)
-                let message = receiver.lock().unwrap().recv();
-
-                match message {
-                    Ok(job) => job(),
-                    Err(_) => break, // channel closed -> pool is being destroyed, exit the loop
-                }
-            }
-        });
-
-        Worker {
-            _id,
-            handle: Some(handle),
-        }
-    }
-}
-
-struct Threadpool {
-    workers: Vec<Worker>,
-    sender: Option<mpsc::Sender<Job>>,
-    pending: Arc<(Mutex<usize>, Condvar)>,
-}
-
-impl Threadpool {
-    fn new() -> Threadpool {
-        let num_threads = thread::available_parallelism().unwrap().get();
-        let (sender, receiver) = mpsc::channel();
-        let receiver = Arc::new(Mutex::new(receiver));
-
-        let mut workers = Vec::with_capacity(num_threads);
-        for id in 0..num_threads {
-            workers.push(Worker::new(id, Arc::clone(&receiver)));
-        }
-
-        Threadpool {
-            workers,
-            sender: Some(sender),
-            pending: Arc::new((Mutex::new(0), Condvar::new())),
-        }
-    }
-
-    fn execute<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        // "Add(1)" -- increment the pending count before the job is sent to the queue (avoids race condition)
-        *self.pending.0.lock().unwrap() += 1;
-
-        let pending = Arc::clone(&self.pending);
-        let job: Job = Box::new(move || {
-            // Execute the job and catch any panics to prevent the thread from crashing
-            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-                eprintln!("trawl: worker task panicked: {:?}", payload);
-            }
-
-            let (lock, cvar) = pending.as_ref();
-            let mut count = lock.lock().unwrap();
-            *count -= 1; // "Done()"
-            if *count == 0 {
-                cvar.notify_all();
-            }
-        });
-
-        self.sender.as_ref().unwrap().send(job).unwrap();
-    }
-
-    /// Block until the queue and all its spawned subtasks have been processed.
-    fn wait(&self) {
-        let (lock, cvar) = &*self.pending;
-        let mut count = lock.lock().unwrap();
-        while *count != 0 {
-            count = cvar.wait(count).unwrap();
-        }
-    }
-}
-
-impl Drop for Threadpool {
-    fn drop(&mut self) {
-        drop(self.sender.take()); // close the channel -> workers exit the loop
-
-        for worker in &mut self.workers {
-            if let Some(handle) = worker.handle.take() {
-                handle.join().unwrap();
-            }
-        }
-    }
-}
 
 const CONTEXT: usize = 20; // how many characters of context to show around a match
 
@@ -327,9 +228,9 @@ fn highlight_all(text: &str, pattern: &str, base: Color, case_sensitive: bool) -
     result
 }
 
-fn handle_path(
+fn handle_path<'scope>(
     path: PathBuf,
-    pool: Arc<Threadpool>,
+    s: &rayon::Scope<'scope>,
     pattern: Arc<String>,
     tx: mpsc::Sender<String>,
     cmd_options: Arc<CmdOptions>,
@@ -357,14 +258,20 @@ fn handle_path(
                     let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan, case_sensitive));
                 }
 
-                // The block shadows the outer Arc/Sender bindings with clones scoped to just
-                // this argument, so `pool.execute` below still refers to the original `pool`.
-                pool.execute({
-                    let pool = Arc::clone(&pool);
+                // rayon::scope propagates a panicking task's panic to the thread that
+                // called .scope() once all spawned tasks finish - catch_unwind here keeps
+                // the original "log and keep going" behavior for a single bad file/dir.
+                s.spawn({
                     let pattern = Arc::clone(&pattern);
                     let tx = tx.clone();
                     let cmd_options = Arc::clone(&cmd_options);
-                    move || handle_path(entry_path, pool, pattern, tx, cmd_options)
+                    move |s| {
+                        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_path(entry_path, s, pattern, tx, cmd_options)
+                        })) {
+                            eprintln!("trawl: worker task panicked: {:?}", payload);
+                        }
+                    }
                 });
             }
         }
@@ -597,12 +504,11 @@ fn main() {
         }
     });
 
-    let pool = Arc::new(Threadpool::new());
-
-    // Start processing from the current working directory.
-    handle_path(cwd, Arc::clone(&pool), pattern, tx, cmd_options);
-
-    pool.wait(); // Wait until all jobs and their subtasks are processed
+    // Start processing from the current working directory. rayon::scope blocks until this
+    // task and all recursively spawned subtasks have finished (replaces the old WaitGroup).
+    rayon::scope(|s| {
+        handle_path(cwd, s, pattern, tx, cmd_options);
+    });
 
     printer.join().unwrap(); // all senders are dropped by now, so the channel is closed
 
