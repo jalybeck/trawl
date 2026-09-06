@@ -368,7 +368,7 @@ fn handle_path(
                 schedule_batch(&pool, batch, &pattern, &tx, &cmd_options);
             }
         }
-    } else {
+    } else if !cmd_options.has(CmdOption::NoContent) {
         search_file(&path, &pattern, tx, cmd_options.has(CmdOption::CaseSensitive));
     }
 }
@@ -542,6 +542,7 @@ enum CmdOption {
     Excluded,
     All,
     CaseSensitive,
+    NoContent,
 }
 
 struct CmdOptions {
@@ -567,6 +568,7 @@ Options:
   -e, --excluded       Also search common build/dependency directories (target, node_modules, dist, ...)
   -a, --all            Shorthand for --hidden --excluded
   -c, --case-sensitive Case-sensitive search (default: case-insensitive)
+  -nc, --no-content    Only match file/directory names, don't search file contents
 ";
 
 fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
@@ -588,6 +590,7 @@ fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
             "-e" | "--excluded" => options.push(CmdOption::Excluded),
             "-a" | "--all" => options.push(CmdOption::All),
             "-c" | "--case-sensitive" => options.push(CmdOption::CaseSensitive),
+            "-nc" | "--no-content" => options.push(CmdOption::NoContent),
             _ => {}
         }
     }
