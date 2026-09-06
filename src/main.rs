@@ -73,7 +73,7 @@ impl Threadpool {
                 eprintln!("trawl: worker task panicked: {:?}", payload);
             }
 
-            let (lock, cvar) = &*pending;
+            let (lock, cvar) = pending.as_ref();
             let mut count = lock.lock().unwrap();
             *count -= 1; // "Done()"
             if *count == 0 {
