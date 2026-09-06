@@ -15,16 +15,12 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    // crossbeam's Receiver is a lock-free MPMC, so it's cloned directly instead of
+    // wrapping a single receiver in Arc<Mutex<..>> (no shared-lock contention on dequeue).
+    fn new(_id: usize, receiver: crossbeam_channel::Receiver<Job>) -> Worker {
         let handle = thread::spawn(move || {
-            loop {
-                // lock is released immediately after the message is received (recv returns the value)
-                let message = receiver.lock().unwrap().recv();
-
-                match message {
-                    Ok(job) => job(),
-                    Err(_) => break, // channel closed -> pool is being destroyed, exit the loop
-                }
+            while let Ok(job) = receiver.recv() {
+                job();
             }
         });
 
@@ -37,19 +33,18 @@ impl Worker {
 
 struct Threadpool {
     workers: Vec<Worker>,
-    sender: Option<mpsc::Sender<Job>>,
+    sender: Option<crossbeam_channel::Sender<Job>>,
     pending: Arc<(Mutex<usize>, Condvar)>,
 }
 
 impl Threadpool {
     fn new() -> Threadpool {
         let num_threads = thread::available_parallelism().unwrap().get();
-        let (sender, receiver) = mpsc::channel();
-        let receiver = Arc::new(Mutex::new(receiver));
+        let (sender, receiver) = crossbeam_channel::unbounded();
 
         let mut workers = Vec::with_capacity(num_threads);
         for id in 0..num_threads {
-            workers.push(Worker::new(id, Arc::clone(&receiver)));
+            workers.push(Worker::new(id, receiver.clone()));
         }
 
         Threadpool {
@@ -327,6 +322,10 @@ fn highlight_all(text: &str, pattern: &str, base: Color, case_sensitive: bool) -
     result
 }
 
+// Entries get grouped into chunks and scheduled as one job per chunk instead of one job per
+// entry - cuts down the number of channel sends/receives for directories with many files.
+const BATCH_SIZE: usize = 64;
+
 fn handle_path(
     path: PathBuf,
     pool: Arc<Threadpool>,
@@ -336,6 +335,8 @@ fn handle_path(
 ) {
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&path) {
+            let mut batch: Vec<PathBuf> = Vec::with_capacity(BATCH_SIZE);
+
             for entry in entries.flatten() {
                 if is_symlink(&entry) {
                     continue;
@@ -357,20 +358,45 @@ fn handle_path(
                     let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan, case_sensitive));
                 }
 
-                // The block shadows the outer Arc/Sender bindings with clones scoped to just
-                // this argument, so `pool.execute` below still refers to the original `pool`.
-                pool.execute({
-                    let pool = Arc::clone(&pool);
-                    let pattern = Arc::clone(&pattern);
-                    let tx = tx.clone();
-                    let cmd_options = Arc::clone(&cmd_options);
-                    move || handle_path(entry_path, pool, pattern, tx, cmd_options)
-                });
+                batch.push(entry_path);
+                if batch.len() == BATCH_SIZE {
+                    schedule_batch(&pool, std::mem::take(&mut batch), &pattern, &tx, &cmd_options);
+                }
+            }
+
+            if !batch.is_empty() {
+                schedule_batch(&pool, batch, &pattern, &tx, &cmd_options);
             }
         }
     } else {
         search_file(&path, &pattern, tx, cmd_options.has(CmdOption::CaseSensitive));
     }
+}
+
+// Schedules one job that processes every path in `batch` sequentially. Each entry's
+// `handle_path` call is caught individually so one panicking entry doesn't abort the rest
+// of the batch (the pool's own catch_unwind around the whole job is a last-resort net only).
+fn schedule_batch(
+    pool: &Arc<Threadpool>,
+    batch: Vec<PathBuf>,
+    pattern: &Arc<String>,
+    tx: &mpsc::Sender<String>,
+    cmd_options: &Arc<CmdOptions>,
+) {
+    let pool_clone = Arc::clone(pool);
+    let pattern = Arc::clone(pattern);
+    let tx = tx.clone();
+    let cmd_options = Arc::clone(cmd_options);
+
+    pool.execute(move || {
+        for entry_path in batch {
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_path(entry_path, Arc::clone(&pool_clone), Arc::clone(&pattern), tx.clone(), Arc::clone(&cmd_options));
+            })) {
+                eprintln!("trawl: worker task panicked: {:?}", payload);
+            }
+        }
+    });
 }
 
 fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>, case_sensitive: bool) {
