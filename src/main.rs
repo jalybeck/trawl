@@ -449,7 +449,7 @@ fn process_line(
         let path_str = path.display().to_string();
         let _ = tx.send(format!(
             "{}:{}: {}{}{}{}{}",
-            highlight_all(&path_str, pattern, Color::Blue, case_sensitive),
+            highlight_all(&path_str, pattern, Color::BrightBlue, case_sensitive),
             line_no.to_string().yellow(),
             prefix,
             before,
