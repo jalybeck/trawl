@@ -424,7 +424,17 @@ fn search_utf8_lines(
         };
         line_no += 1;
 
-        let line = String::from_utf8_lossy(&buf);
+        // Binary content can start anywhere in a file (e.g. a PDF's plain-text header followed
+        // by compressed streams), so re-check for NUL bytes / invalid UTF-8 on every line and
+        // bail out of the whole file the moment either is hit - not just on the first buffered
+        // chunk. Without this, from_utf8_lossy() can silently reassemble a pattern's exact UTF-8
+        // bytes out of garbage binary data (e.g. searching "©" matched inside random PDF bytes).
+        if buf.contains(&0) {
+            return;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            return;
+        };
         let line = line.trim_end_matches(['\r', '\n']);
 
         process_line(path, pattern, line_no, line, tx, case_sensitive);
@@ -757,6 +767,36 @@ mod tests {
         let bytes = vec![b'a', b'b', 0u8, b'c', b'd'];
         let results = run_search(&bytes, "ab", "binary");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn binary_content_appearing_after_valid_text_lines_is_skipped() {
+        // Simulates a file (e.g. a PDF) whose first buffered chunk is plain-text-like and only
+        // turns into binary garbage further in - the NUL byte here would be missed by a check
+        // that only inspects the first peeked chunk.
+        let mut bytes = b"%PDF-1.4\nsome header text\n".to_vec();
+        bytes.extend_from_slice(&[0x00, 0x01, 0x02, b'\n']);
+        bytes.extend_from_slice(b"needle should not be reached\n");
+        let results = run_search(&bytes, "needle", "binary_later_null");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn copyright_symbol_does_not_leak_from_invalid_utf8_binary_data() {
+        // Regression test: searching a multi-byte pattern like '©' (UTF-8 bytes C2 A9) must not
+        // match when those exact bytes happen to occur inside otherwise-invalid UTF-8 binary
+        // data with no NUL byte present - from_utf8_lossy() used to silently paper over the
+        // invalid bytes around it and let the match through.
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xC2, 0xA9, 0xFE, b'\n']);
+        let results = run_search(&bytes, "\u{a9}", "pdf_copyright_no_null");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn copyright_symbol_still_matches_in_real_utf8_text() {
+        let results = run_search("price © 2024 example\n".as_bytes(), "\u{a9}", "real_copyright");
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
