@@ -569,7 +569,8 @@ Options:
   -a, --all            Shorthand for --hidden --excluded
   -c, --case-sensitive Case-sensitive search (default: case-insensitive)
   -nc, --no-content    Only match file/directory names, don't search file contents
-";
+  -p, --path <path>    Search starting from <path> instead of the current directory
+  ";
 
 fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
     let Ok(cwd) = std::env::current_dir() else {
@@ -581,21 +582,36 @@ fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
         eprint!("{USAGE}");
         std::process::exit(1);
     };
-    
+
     // Extract commandline options
     let mut options = Vec::new();
-    for arg in std::env::args().skip(1) {
+    let mut custom_path: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--hidden" => options.push(CmdOption::Hidden),
             "-e" | "--excluded" => options.push(CmdOption::Excluded),
             "-a" | "--all" => options.push(CmdOption::All),
             "-c" | "--case-sensitive" => options.push(CmdOption::CaseSensitive),
             "-nc" | "--no-content" => options.push(CmdOption::NoContent),
+            "-p" | "--path" => {
+                let Some(path) = args.next() else {
+                    eprintln!("trawl: -p requires a path argument");
+                    eprint!("{USAGE}");
+                    std::process::exit(1);
+                };
+                custom_path = Some(path);
+            }
             _ => {}
         }
     }
 
-    (cwd, pattern, CmdOptions { options })
+    let start_path = match custom_path {
+        Some(p) => PathBuf::from(p),
+        None => cwd,
+    };
+
+    (start_path, pattern, CmdOptions { options })
 }
 
 fn main() {
