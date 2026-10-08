@@ -60,6 +60,6 @@ build and publishes release packages; older versions are not kept.
 <!-- BUILD_TABLE_START -->
 | Package | Platform | Built |
 | --- | --- | --- |
-| [trawl_win_x64.zip](https://github.com/jalybeck/trawl/releases/latest/download/trawl_win_x64.zip) | Windows x64 | 2026-09-19 07:38 UTC |
-| [trawl_linux_x64.tar.gz](https://github.com/jalybeck/trawl/releases/latest/download/trawl_linux_x64.tar.gz) | Linux x64 | 2026-09-19 07:38 UTC |
+| [trawl_win_x64.zip](https://github.com/jalybeck/trawl/releases/latest/download/trawl_win_x64.zip) | Windows x64 | 2026-10-08 16:11 UTC |
+| [trawl_linux_x64.tar.gz](https://github.com/jalybeck/trawl/releases/latest/download/trawl_linux_x64.tar.gz) | Linux x64 | 2026-10-08 16:11 UTC |
 <!-- BUILD_TABLE_END -->
