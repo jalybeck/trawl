@@ -322,6 +322,47 @@ fn highlight_all(text: &str, pattern: &str, base: Color, case_sensitive: bool) -
     result
 }
 
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    let mut unit = 0;
+    let mut divisor = 1_u128;
+    while u128::from(bytes) >= divisor * 1_000 && unit + 1 < UNITS.len() {
+        divisor *= 1_000;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{bytes} B");
+    }
+    let mut tenths = (u128::from(bytes) * 10 + divisor / 2) / divisor;
+    // Rounding 999.95 KB should display 1 MB, rather than 1000 KB.
+    if tenths >= 10_000 && unit + 1 < UNITS.len() {
+        divisor *= 1_000;
+        unit += 1;
+        tenths = (u128::from(bytes) * 10 + divisor / 2) / divisor;
+    }
+    if tenths.is_multiple_of(10) {
+        format!("{} {}", tenths / 10, UNITS[unit])
+    } else {
+        format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
+    }
+}
+
+fn format_match_path(
+    path: &Path,
+    pattern: &str,
+    base: Color,
+    case_sensitive: bool,
+    file_size: Option<u64>,
+) -> String {
+    let mut label = highlight_all(&path.to_string_lossy(), pattern, base, case_sensitive);
+    if let Some(bytes) = file_size {
+        let size_label = format!("({})", format_file_size(bytes));
+        label.push(' ');
+        label.push_str(&size_label.bright_magenta().to_string());
+    }
+    label
+}
+
 // Entries get grouped into chunks and scheduled as one job per chunk instead of one job per
 // entry - cuts down the number of channel sends/receives for directories with many files.
 const BATCH_SIZE: usize = 64;
@@ -353,6 +394,7 @@ fn handle_path(
                 let entry_path = entry.path();
                 let case_sensitive = cmd_options.has(CmdOption::CaseSensitive);
                 let mut matches_size = true;
+                let mut file_size = None;
                 if !cmd_options.size_filters.is_empty() {
                     let Ok(metadata) = entry.metadata() else {
                         continue;
@@ -362,18 +404,20 @@ fn handle_path(
                         matches_size = false;
                     } else if !metadata.is_file() || !cmd_options.matches_size(metadata.len()) {
                         continue;
+                    } else {
+                        file_size = Some(metadata.len());
                     }
                 }
 
                 // Check if the file name contains the pattern before scheduling it for processing
                 let file_name = entry.file_name().to_string_lossy().into_owned();
                 if matches_size && contains_pattern(&file_name, &pattern, case_sensitive) {
-                    let full_path = entry_path.to_string_lossy();
-                    let _ = tx.send(highlight_all(
-                        &full_path,
+                    let _ = tx.send(format_match_path(
+                        &entry_path,
                         &pattern,
                         Color::Cyan,
                         case_sensitive,
+                        file_size,
                     ));
                 }
 
@@ -394,6 +438,7 @@ fn handle_path(
             }
         }
     } else if !cmd_options.has(CmdOption::NoContent) {
+        let mut file_size = None;
         if !cmd_options.size_filters.is_empty() {
             let Ok(metadata) = path.metadata() else {
                 return;
@@ -401,12 +446,14 @@ fn handle_path(
             if !metadata.is_file() || !cmd_options.matches_size(metadata.len()) {
                 return;
             }
+            file_size = Some(metadata.len());
         }
         search_file(
             &path,
             &pattern,
             tx,
             cmd_options.has(CmdOption::CaseSensitive),
+            file_size,
         );
     }
 }
@@ -437,7 +484,13 @@ fn schedule_batch(
     });
 }
 
-fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>, case_sensitive: bool) {
+fn search_file(
+    path: &Path,
+    pattern: &str,
+    tx: mpsc::Sender<String>,
+    case_sensitive: bool,
+    file_size: Option<u64>,
+) {
     let Ok(file) = File::open(path) else { return };
     let mut reader = BufReader::new(file);
 
@@ -453,7 +506,7 @@ fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>, case_sensit
             Ok(_) => {}
             Err(_) => return,
         }
-        search_utf8_lines(&mut reader, path, pattern, &tx, case_sensitive);
+        search_utf8_lines(&mut reader, path, pattern, &tx, case_sensitive, file_size);
         return;
     }
 
@@ -474,7 +527,7 @@ fn search_file(path: &Path, pattern: &str, tx: mpsc::Sender<String>, case_sensit
     };
 
     for (i, line) in text.lines().enumerate() {
-        process_line(path, pattern, i + 1, line, &tx, case_sensitive);
+        process_line(path, pattern, i + 1, line, &tx, case_sensitive, file_size);
     }
 }
 
@@ -484,6 +537,7 @@ fn search_utf8_lines(
     pattern: &str,
     tx: &mpsc::Sender<String>,
     case_sensitive: bool,
+    file_size: Option<u64>,
 ) {
     let mut buf = Vec::new(); // reused for each line to avoid repeated allocations
     let mut line_no = 0usize;
@@ -510,7 +564,7 @@ fn search_utf8_lines(
         };
         let line = line.trim_end_matches(['\r', '\n']);
 
-        process_line(path, pattern, line_no, line, tx, case_sensitive);
+        process_line(path, pattern, line_no, line, tx, case_sensitive, file_size);
     }
 }
 
@@ -521,6 +575,7 @@ fn process_line(
     line: &str,
     tx: &mpsc::Sender<String>,
     case_sensitive: bool,
+    file_size: Option<u64>,
 ) {
     if let Some(pos) = find_pattern(line, pattern, case_sensitive) {
         let from = floor_char_boundary(line, pos.saturating_sub(CONTEXT));
@@ -533,10 +588,15 @@ fn process_line(
         let prefix = if from == 0 { "" } else { "..." };
         let suffix = if to == line.len() { "" } else { "..." };
 
-        let path_str = path.display().to_string();
         let _ = tx.send(format!(
             "{}:{}: {}{}{}{}{}",
-            highlight_all(&path_str, pattern, Color::BrightBlue, case_sensitive),
+            format_match_path(
+                path,
+                pattern,
+                Color::BrightBlue,
+                case_sensitive,
+                file_size,
+            ),
             line_no.to_string().yellow(),
             prefix,
             before,
@@ -704,6 +764,7 @@ Options:
   -c, --case-sensitive Case-sensitive search (default: case-insensitive)
   -nc, --no-content    Only match file/directory names, don't search file contents
   -s, --size <filter>  Filter files by size, e.g. \"<5KB\" or \"> 2.5MB\" (also with -nc)
+                      Show rounded file sizes after file names
   -p, --path <path>    Search starting from <path> instead of the current directory
 
 Size filters: <, <=, >, >=, = (default); B, KB, MB, GB, TB (powers of 1000),
@@ -969,14 +1030,16 @@ mod tests {
         let small = root.join("needle_small.txt");
         let large = root.join("needle_large.txt");
         std::fs::write(&small, b"needle").unwrap();
-        std::fs::write(&large, b"needle large content").unwrap();
+        let mut large_content = b"needle large content".to_vec();
+        large_content.resize(1_549, b' ');
+        std::fs::write(&large, large_content).unwrap();
         std::fs::write(nested.join("plain.txt"), b"needle").unwrap();
         std::fs::write(root.join("empty.txt"), b"").unwrap();
 
         let normal = run_tree_search(&root, Some("<10B"), false);
         assert_eq!(normal.len(), 3, "{normal:?}");
         assert!(
-            normal.iter().any(|line| line.contains("plain.txt:1:")),
+            normal.iter().any(|line| line.contains("plain.txt (6 B):1:")),
             "{normal:?}"
         );
         assert!(
@@ -985,10 +1048,10 @@ mod tests {
         );
         let names = run_tree_search(&root, Some("<10B"), true);
         assert_eq!(names.len(), 1, "{names:?}");
-        assert!(names[0].contains("needle_small.txt"));
+        assert!(names[0].ends_with("needle_small.txt (6 B)"));
         let larger = run_tree_search(&root, Some(">6B"), true);
         assert_eq!(larger.len(), 1, "{larger:?}");
-        assert!(larger[0].contains("needle_large.txt"));
+        assert!(larger[0].ends_with("needle_large.txt (1.5 KB)"));
         let unfiltered = run_tree_search(&root, None, true);
         assert_eq!(unfiltered.len(), 3, "{unfiltered:?}");
         assert!(
@@ -1037,7 +1100,7 @@ mod tests {
         colored::control::set_override(false);
         let path = write_temp_file(name_hint, bytes);
         let (tx, rx) = mpsc::channel();
-        search_file(&path, pattern, tx, case_sensitive);
+        search_file(&path, pattern, tx, case_sensitive, None);
         let results: Vec<String> = rx.iter().collect();
         let _ = std::fs::remove_file(&path);
         results

@@ -28,6 +28,9 @@ powers of 1024. Repeated filters must all match.
 Quote filters containing `<` or `>` so your shell passes them to Trawl.
 With a size filter, directories are still traversed but only matching files
 are reported. The filter also applies to a file supplied with `-p`.
+File names are followed by the size in magenta parentheses, for example
+`report.txt (2.5 MB)`, in both name and content matches. Sizes use powers of 1000
+and are rounded to one decimal place, omitting a trailing `.0`.
 
 ## Goals
 
