@@ -344,23 +344,48 @@ fn handle_path(
                 if !cmd_options.has(CmdOption::Hidden) && is_hidden(&entry) {
                     continue;
                 }
-                if !cmd_options.has(CmdOption::Excluded) && (is_excluded_dir(&entry) || is_cloud_placeholder(&entry)) {
+                if !cmd_options.has(CmdOption::Excluded)
+                    && (is_excluded_dir(&entry) || is_cloud_placeholder(&entry))
+                {
                     continue;
                 }
 
                 let entry_path = entry.path();
                 let case_sensitive = cmd_options.has(CmdOption::CaseSensitive);
+                let mut matches_size = true;
+                if !cmd_options.size_filters.is_empty() {
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    if metadata.is_dir() {
+                        // Always traverse directories, but only report files with a size filter.
+                        matches_size = false;
+                    } else if !metadata.is_file() || !cmd_options.matches_size(metadata.len()) {
+                        continue;
+                    }
+                }
 
                 // Check if the file name contains the pattern before scheduling it for processing
                 let file_name = entry.file_name().to_string_lossy().into_owned();
-                if contains_pattern(&file_name, &pattern, case_sensitive) {
+                if matches_size && contains_pattern(&file_name, &pattern, case_sensitive) {
                     let full_path = entry_path.to_string_lossy();
-                    let _ = tx.send(highlight_all(&full_path, &pattern, Color::Cyan, case_sensitive));
+                    let _ = tx.send(highlight_all(
+                        &full_path,
+                        &pattern,
+                        Color::Cyan,
+                        case_sensitive,
+                    ));
                 }
 
                 batch.push(entry_path);
                 if batch.len() == BATCH_SIZE {
-                    schedule_batch(&pool, std::mem::take(&mut batch), &pattern, &tx, &cmd_options);
+                    schedule_batch(
+                        &pool,
+                        std::mem::take(&mut batch),
+                        &pattern,
+                        &tx,
+                        &cmd_options,
+                    );
                 }
             }
 
@@ -369,7 +394,20 @@ fn handle_path(
             }
         }
     } else if !cmd_options.has(CmdOption::NoContent) {
-        search_file(&path, &pattern, tx, cmd_options.has(CmdOption::CaseSensitive));
+        if !cmd_options.size_filters.is_empty() {
+            let Ok(metadata) = path.metadata() else {
+                return;
+            };
+            if !metadata.is_file() || !cmd_options.matches_size(metadata.len()) {
+                return;
+            }
+        }
+        search_file(
+            &path,
+            &pattern,
+            tx,
+            cmd_options.has(CmdOption::CaseSensitive),
+        );
     }
 }
 
@@ -545,11 +583,107 @@ enum CmdOption {
     NoContent,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SizeComparison {
+    Less,
+    LessOrEqual,
+    Equal,
+    GreaterOrEqual,
+    Greater,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SizeFilter {
+    comparison: SizeComparison,
+    bytes: u64,
+    fractional_byte: bool,
+}
+
+impl SizeFilter {
+    fn parse(input: &str) -> Result<Self, String> {
+        let input = input.trim();
+        let (comparison, value) = if let Some(value) = input.strip_prefix("<=") {
+            (SizeComparison::LessOrEqual, value)
+        } else if let Some(value) = input.strip_prefix(">=") {
+            (SizeComparison::GreaterOrEqual, value)
+        } else if let Some(value) = input.strip_prefix('<') {
+            (SizeComparison::Less, value)
+        } else if let Some(value) = input.strip_prefix('>') {
+            (SizeComparison::Greater, value)
+        } else if let Some(value) = input.strip_prefix('=') {
+            (SizeComparison::Equal, value)
+        } else {
+            (SizeComparison::Equal, input)
+        };
+        let value = value.trim();
+        let number_end = value
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(value.len());
+        let (number, unit) = value.split_at(number_end);
+        let invalid = || format!("invalid size filter {input:?}; use e.g. \"<5KB\" or \"> 2.5MB\"");
+        if number.is_empty() || !number.bytes().any(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let multiplier: u128 = match unit.trim().to_ascii_lowercase().as_str() {
+            "" | "b" => 1,
+            "kb" => 1_000,
+            "mb" => 1_000_000,
+            "gb" => 1_000_000_000,
+            "tb" => 1_000_000_000_000,
+            "kib" => 1 << 10,
+            "mib" => 1 << 20,
+            "gib" => 1 << 30,
+            "tib" => 1 << 40,
+            _ => return Err(invalid()),
+        };
+        let (whole, fractional) = number.split_once('.').unwrap_or((number, ""));
+        // Integer arithmetic keeps comparisons accurate even above f64's exact range.
+        let digits = format!("{whole}{fractional}");
+        let numerator = digits
+            .parse::<u128>()
+            .map_err(|_| invalid())?
+            .checked_mul(multiplier)
+            .ok_or_else(invalid)?;
+        let precision = u32::try_from(fractional.len()).map_err(|_| invalid())?;
+        let denominator = 10_u128.checked_pow(precision).ok_or_else(invalid)?;
+        let bytes = u64::try_from(numerator / denominator).map_err(|_| invalid())?;
+        let fractional_byte = numerator % denominator != 0;
+        if bytes == u64::MAX && fractional_byte {
+            return Err(invalid());
+        }
+        Ok(Self {
+            comparison,
+            bytes,
+            fractional_byte,
+        })
+    }
+
+    fn matches(&self, bytes: u64) -> bool {
+        use std::cmp::Ordering;
+        let ordering = match bytes.cmp(&self.bytes) {
+            Ordering::Equal if self.fractional_byte => Ordering::Less,
+            ordering => ordering,
+        };
+        match self.comparison {
+            SizeComparison::Less => ordering == Ordering::Less,
+            SizeComparison::LessOrEqual => ordering != Ordering::Greater,
+            SizeComparison::Equal => ordering == Ordering::Equal,
+            SizeComparison::GreaterOrEqual => ordering != Ordering::Less,
+            SizeComparison::Greater => ordering == Ordering::Greater,
+        }
+    }
+}
+
 struct CmdOptions {
-    options: Vec<CmdOption>
+    options: Vec<CmdOption>,
+    size_filters: Vec<SizeFilter>,
 }
 
 impl CmdOptions {
+    fn matches_size(&self, bytes: u64) -> bool {
+        self.size_filters.iter().all(|filter| filter.matches(bytes))
+    }
+
     fn has(&self, option: CmdOption) -> bool {
         // CaseSensitive is deliberately excluded from the --all shorthand: search is
         // case-insensitive by default and must be opted into explicitly via -c.
@@ -569,7 +703,13 @@ Options:
   -a, --all            Shorthand for --hidden --excluded
   -c, --case-sensitive Case-sensitive search (default: case-insensitive)
   -nc, --no-content    Only match file/directory names, don't search file contents
+  -s, --size <filter>  Filter files by size, e.g. \"<5KB\" or \"> 2.5MB\" (also with -nc)
   -p, --path <path>    Search starting from <path> instead of the current directory
+
+Size filters: <, <=, >, >=, = (default); B, KB, MB, GB, TB (powers of 1000),
+              KiB, MiB, GiB, TiB (powers of 1024). Units are case-insensitive.
+              Quote filters containing < or >. Repeat -s to combine limits.
+              Directories are traversed but not reported when filtering by size.
   ";
 
 fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
@@ -578,15 +718,23 @@ fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
         std::process::exit(1);
     };
 
-    let Some(pattern) = std::env::args().nth(1) else {
+    parse_args(std::env::args().skip(1), cwd).unwrap_or_else(|error| {
+        eprintln!("trawl: {error}");
         eprint!("{USAGE}");
         std::process::exit(1);
-    };
+    })
+}
+
+fn parse_args(
+    mut args: impl Iterator<Item = String>,
+    cwd: PathBuf,
+) -> Result<(PathBuf, String, CmdOptions), String> {
+    let pattern = args.next().ok_or("a search keyword is required")?;
 
     // Extract commandline options
     let mut options = Vec::new();
+    let mut size_filters = Vec::new();
     let mut custom_path: Option<String> = None;
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--hidden" => options.push(CmdOption::Hidden),
@@ -594,12 +742,18 @@ fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
             "-a" | "--all" => options.push(CmdOption::All),
             "-c" | "--case-sensitive" => options.push(CmdOption::CaseSensitive),
             "-nc" | "--no-content" => options.push(CmdOption::NoContent),
+            "-s" | "--size" => {
+                let mut filter = args.next().ok_or("-s requires a size filter")?;
+                if matches!(filter.as_str(), "<" | "<=" | ">" | ">=" | "=") {
+                    let value = args
+                        .next()
+                        .ok_or("-s requires a size after the comparison")?;
+                    filter.push_str(&value);
+                }
+                size_filters.push(SizeFilter::parse(&filter)?);
+            }
             "-p" | "--path" => {
-                let Some(path) = args.next() else {
-                    eprintln!("trawl: -p requires a path argument");
-                    eprint!("{USAGE}");
-                    std::process::exit(1);
-                };
+                let path = args.next().ok_or("-p requires a path argument")?;
                 custom_path = Some(path);
             }
             _ => {}
@@ -611,7 +765,14 @@ fn handle_args() -> (std::path::PathBuf, String, CmdOptions) {
         None => cwd,
     };
 
-    (start_path, pattern, CmdOptions { options })
+    Ok((
+        start_path,
+        pattern,
+        CmdOptions {
+            options,
+            size_filters,
+        },
+    ))
 }
 
 fn main() {
@@ -664,6 +825,189 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn size_filters_parse_units_decimals_and_comparison_boundaries() {
+        for (input, threshold) in [
+            ("<5kb", 5_000),
+            ("> 2.5MB", 2_500_000),
+            ("<= 1.5 KiB", 1_536),
+            (">=1GB", 1_000_000_000),
+            ("=2MiB", 2_097_152),
+            ("3GiB", 3_221_225_472),
+            ("1tb", 1_000_000_000_000),
+            ("1TiB", 1_099_511_627_776),
+            (" 42 B ", 42),
+            ("42", 42),
+        ] {
+            let filter = SizeFilter::parse(input).unwrap();
+            assert_eq!(filter.bytes, threshold, "{input}");
+            assert!(!filter.fractional_byte, "{input}");
+        }
+        for (input, expected) in [
+            ("<10", [true, false, false]),
+            ("<=10", [true, true, false]),
+            ("=10", [false, true, false]),
+            (">=10", [false, true, true]),
+            (">10", [false, false, true]),
+        ] {
+            let filter = SizeFilter::parse(input).unwrap();
+            assert_eq!(
+                [filter.matches(9), filter.matches(10), filter.matches(11)],
+                expected,
+                "{input}"
+            );
+        }
+        assert!(SizeFilter::parse("<.5B").unwrap().matches(0));
+        assert!(!SizeFilter::parse("<.5B").unwrap().matches(1));
+        assert!(!SizeFilter::parse(">=10.1B").unwrap().matches(10));
+        assert!(SizeFilter::parse(">=10.1B").unwrap().matches(11));
+        assert!(!SizeFilter::parse("=10.1B").unwrap().matches(10));
+        let large = SizeFilter::parse(">9007199254740992B").unwrap();
+        assert!(!large.matches(9_007_199_254_740_992));
+        assert!(large.matches(9_007_199_254_740_993));
+        assert!(
+            SizeFilter::parse("18446744073709551615B")
+                .unwrap()
+                .matches(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn size_filters_reject_invalid_values() {
+        for input in [
+            "",
+            "<",
+            "KB",
+            "<KB",
+            "-1KB",
+            ">-1",
+            "NaN",
+            "inf",
+            "1.2.3MB",
+            "5XB",
+            "5 KB junk",
+            "1 2KB",
+            "<<5KB",
+            "=>5KB",
+            "2,5MB",
+            "18446744073709551616B",
+            "18446744073709551615.1B",
+            "999999999999999999999999999999999999999TB",
+        ] {
+            assert!(SizeFilter::parse(input).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn size_arguments_accept_combined_and_separate_comparisons() {
+        let cwd = PathBuf::from("root");
+        let args = [
+            "needle",
+            "-s",
+            ">",
+            "2.5MB",
+            "--size",
+            "<=10MiB",
+            "-nc",
+            "-a",
+            "-p",
+            "elsewhere",
+        ];
+        let (path, pattern, options) =
+            parse_args(args.into_iter().map(String::from), cwd.clone()).unwrap();
+        assert_eq!(path, PathBuf::from("elsewhere"));
+        assert_eq!(pattern, "needle");
+        assert!(options.has(CmdOption::NoContent));
+        assert!(options.has(CmdOption::Hidden));
+        assert!(!options.matches_size(2_500_000));
+        assert!(options.matches_size(2_500_001));
+        assert!(options.matches_size(10_485_760));
+        assert!(!options.matches_size(10_485_761));
+        for args in [
+            vec!["needle", "-s"],
+            vec!["needle", "-s", ">"],
+            vec!["needle", "--size", "invalid"],
+            vec!["needle", "-s", "-nc"],
+        ] {
+            assert!(parse_args(args.into_iter().map(String::from), cwd.clone()).is_err());
+        }
+    }
+
+    fn run_tree_search(path: &Path, filter: Option<&str>, no_content: bool) -> Vec<String> {
+        let pool = Arc::new(Threadpool::new());
+        let (tx, rx) = mpsc::channel();
+        let options = CmdOptions {
+            options: if no_content {
+                vec![CmdOption::NoContent]
+            } else {
+                Vec::new()
+            },
+            size_filters: filter
+                .map(|filter| vec![SizeFilter::parse(filter).unwrap()])
+                .unwrap_or_default(),
+        };
+        handle_path(
+            path.to_path_buf(),
+            Arc::clone(&pool),
+            Arc::new("needle".to_owned()),
+            tx,
+            Arc::new(options),
+        );
+        pool.wait();
+        rx.iter().collect()
+    }
+
+    #[test]
+    fn size_filter_covers_names_contents_subdirectories_and_direct_files() {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("trawl_size_test_{}_{}", std::process::id(), id));
+        std::fs::create_dir(&root).unwrap();
+        let nested = root.join("needle_directory");
+        std::fs::create_dir(&nested).unwrap();
+        let small = root.join("needle_small.txt");
+        let large = root.join("needle_large.txt");
+        std::fs::write(&small, b"needle").unwrap();
+        std::fs::write(&large, b"needle large content").unwrap();
+        std::fs::write(nested.join("plain.txt"), b"needle").unwrap();
+        std::fs::write(root.join("empty.txt"), b"").unwrap();
+
+        let normal = run_tree_search(&root, Some("<10B"), false);
+        assert_eq!(normal.len(), 3, "{normal:?}");
+        assert!(
+            normal.iter().any(|line| line.contains("plain.txt:1:")),
+            "{normal:?}"
+        );
+        assert!(
+            !normal.iter().any(|line| line.contains("needle_large.txt")),
+            "{normal:?}"
+        );
+        let names = run_tree_search(&root, Some("<10B"), true);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].contains("needle_small.txt"));
+        let larger = run_tree_search(&root, Some(">6B"), true);
+        assert_eq!(larger.len(), 1, "{larger:?}");
+        assert!(larger[0].contains("needle_large.txt"));
+        let unfiltered = run_tree_search(&root, None, true);
+        assert_eq!(unfiltered.len(), 3, "{unfiltered:?}");
+        assert!(
+            unfiltered
+                .iter()
+                .any(|line| line.ends_with("needle_directory"))
+        );
+        assert!(run_tree_search(&small, Some("<6B"), false).is_empty());
+        assert_eq!(run_tree_search(&small, Some("<=6B"), false).len(), 1);
+        assert!(run_tree_search(&root, Some("=0B"), false).is_empty());
+
+        // Remove only the uniquely created fixture and its known children.
+        std::fs::remove_file(small).unwrap();
+        std::fs::remove_file(large).unwrap();
+        std::fs::remove_file(nested.join("plain.txt")).unwrap();
+        std::fs::remove_file(root.join("empty.txt")).unwrap();
+        std::fs::remove_dir(nested).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     fn write_temp_file(name_hint: &str, bytes: &[u8]) -> PathBuf {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -871,6 +1215,7 @@ mod tests {
     fn cmd_option_all_does_not_imply_case_sensitive() {
         let opts = CmdOptions {
             options: vec![CmdOption::All],
+            size_filters: Vec::new(),
         };
         assert!(opts.has(CmdOption::Hidden));
         assert!(opts.has(CmdOption::Excluded));

@@ -8,6 +8,27 @@ The goal of the project is simple: start from the users current directory, trave
 trawl "search term"
 ```
 
+## Filtering by file size
+
+Use `-s` (or `--size`) to filter both file name and content matches by file size.
+The same filter works with `-nc` (names only):
+
+```bash
+trawl "search term" -s "<5kb"
+trawl "search term" -s "> 2.5MB" -nc
+trawl "search term" -s ">=1KB" -s "<=10MiB"
+```
+
+Supported comparisons are `<`, `<=`, `>`, `>=`, and `=`. A size without a
+comparison means equality. Decimal values and spaces inside the quoted filter
+are supported, and units are case-insensitive. No unit means bytes; `B`, `KB`,
+`MB`, `GB`, and `TB` use powers of 1000, while `KiB`, `MiB`, `GiB`, and `TiB` use
+powers of 1024. Repeated filters must all match.
+
+Quote filters containing `<` or `>` so your shell passes them to Trawl.
+With a size filter, directories are still traversed but only matching files
+are reported. The filter also applies to a file supplied with `-p`.
+
 ## Goals
 
 - Search directory names, file names, and file contents
